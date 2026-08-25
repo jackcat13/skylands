@@ -1,4 +1,4 @@
-use crate::simulation::{Building, FoodStock, RunState, RunStatus};
+use crate::simulation::{Building, FoodStock, Road, RunState, RunStatus};
 use crate::world::FlyingIsland;
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
@@ -42,6 +42,7 @@ pub struct RunSaveV1 {
     pub food: FoodStock,
     pub islands: Vec<FlyingIsland>,
     pub buildings: Vec<Building>,
+    pub roads: Vec<Road>,
     pub next_building_id: u32,
 }
 
@@ -78,17 +79,21 @@ impl From<&RunState> for RunSaveV1 {
             food: run.food.clone(),
             islands: run.islands.clone(),
             buildings: run.buildings.clone(),
+            roads: run.roads.values().copied().collect(),
             next_building_id: run.next_building_id,
         }
     }
 }
 
+pub type SaveState = SaveStateV1;
+pub type RunSave = RunSaveV1;
 pub type SaveEnvelopeV1 = BTreeMap<String, serde_json::Value>;
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::simulation::RunState;
+    use crate::simulation::{Road, RunState};
+    use crate::world::TileCoord;
 
     #[test]
     fn save_state_round_trips_as_json() {
@@ -101,5 +106,47 @@ mod tests {
         let loaded = SaveStateV1::from_json(&json).unwrap();
 
         assert_eq!(loaded, save);
+    }
+
+    #[test]
+    fn run_save_round_trips_roads_as_json() {
+        let mut run = RunState::start(10);
+        run.roads.insert(
+            TileCoord::new(-2, 1),
+            Road {
+                coord: TileCoord::new(-2, 1),
+                height: 0,
+            },
+        );
+        run.roads.insert(
+            TileCoord::new(3, -1),
+            Road {
+                coord: TileCoord::new(3, -1),
+                height: 2,
+            },
+        );
+
+        let save = SaveStateV1 {
+            current_run: Some(RunSaveV1::from(&run)),
+            ..SaveStateV1::empty()
+        };
+
+        let json = save.to_json().unwrap();
+        let loaded = SaveStateV1::from_json(&json).unwrap();
+        let roads = loaded.current_run.unwrap().roads;
+
+        assert_eq!(
+            roads,
+            vec![
+                Road {
+                    coord: TileCoord::new(-2, 1),
+                    height: 0,
+                },
+                Road {
+                    coord: TileCoord::new(3, -1),
+                    height: 2,
+                },
+            ]
+        );
     }
 }
