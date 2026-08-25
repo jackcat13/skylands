@@ -112,6 +112,15 @@ impl From<RunSaveV1> for RunState {
     }
 }
 
+impl From<&GameState> for SaveStateV1 {
+    fn from(game: &GameState) -> Self {
+        Self {
+            current_run: game.current_run.as_ref().map(RunSaveV1::from),
+            ..Self::empty()
+        }
+    }
+}
+
 impl From<SaveStateV1> for GameState {
     fn from(save: SaveStateV1) -> Self {
         Self {
@@ -200,6 +209,31 @@ mod tests {
 
         assert_eq!(restored_run.elapsed_seconds, 42);
         assert!(restored_run.roads.contains_key(&TileCoord::new(0, -1)));
+    }
+
+    #[test]
+    fn save_state_captures_current_game_state() {
+        let mut game = GameState {
+            current_run: Some(RunState::start(10)),
+        };
+        let run = game.current_run.as_mut().unwrap();
+        run.elapsed_seconds = 17;
+        let road_coord = TileCoord::new(0, -1);
+        let expected_road_height = run.tile_height(road_coord).unwrap();
+        run.place_roads(&[road_coord]).unwrap();
+
+        let save = SaveStateV1::from(&game);
+        let saved_run = save.current_run.unwrap();
+
+        assert_eq!(save.version, 1);
+        assert_eq!(saved_run.elapsed_seconds, 17);
+        assert_eq!(
+            saved_run.roads,
+            vec![Road {
+                coord: road_coord,
+                height: expected_road_height,
+            }]
+        );
     }
 
     #[test]
