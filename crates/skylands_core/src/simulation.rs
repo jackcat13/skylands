@@ -49,6 +49,12 @@ pub struct RoadPathQuote {
     pub invalid_reason: Option<String>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DemolitionOutcome {
+    Road { coord: TileCoord },
+    Building { id: BuildingId, kind: BuildingKind },
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum RunStatus {
     Running,
@@ -235,6 +241,8 @@ impl RunState {
         kind: BuildingKind,
         origin: TileCoord,
     ) -> Result<BuildingId, String> {
+        self.ensure_editable()?;
+
         let quote = self.quote_building(kind, origin);
         if !quote.valid {
             return Err(quote
@@ -344,6 +352,8 @@ impl RunState {
     }
 
     pub fn place_road_path(&mut self, path: &[TileCoord]) -> Result<Vec<TileCoord>, String> {
+        self.ensure_editable()?;
+
         let quote = self.quote_road_path(path);
         if !quote.valid {
             return Err(quote
@@ -362,6 +372,33 @@ impl RunState {
         }
 
         Ok(placed_coords)
+    }
+
+    pub fn demolish_tile(&mut self, coord: TileCoord) -> Result<DemolitionOutcome, String> {
+        self.ensure_editable()?;
+
+        if self.roads.remove(&coord).is_some() {
+            return Ok(DemolitionOutcome::Road { coord });
+        }
+
+        let Some(building_index) = self
+            .buildings
+            .iter()
+            .position(|building| building_footprint(building.origin).contains(&coord))
+        else {
+            return Err("Nothing to demolish".to_owned());
+        };
+
+        let building = &self.buildings[building_index];
+        if building.kind == BuildingKind::CityCore {
+            return Err("City Core cannot be demolished".to_owned());
+        }
+
+        let building = self.buildings.remove(building_index);
+        Ok(DemolitionOutcome::Building {
+            id: building.id,
+            kind: building.kind,
+        })
     }
 
     pub fn connected_road_coords(&self) -> BTreeSet<TileCoord> {
@@ -433,6 +470,14 @@ impl RunState {
             .iter()
             .find(|building| building.kind == BuildingKind::CityCore)
             .map(|building| building_footprint(building.origin))
+    }
+
+    fn ensure_editable(&self) -> Result<(), String> {
+        if self.status == RunStatus::Bankrupt {
+            return Err("Run is bankrupt".to_owned());
+        }
+
+        Ok(())
     }
 
     fn apply_sky_coin_drain(&mut self) {
@@ -800,6 +845,97 @@ mod road_tests {
         assert!(run.is_building_active(connected_id));
     }
 
+    #[test]
+    fn demolish_removes_roads_without_refund() {
+        let mut run = RunState::start(7);
+        run.place_road_path(&[TileCoord::new(0, -1)]).unwrap();
+        let sky_coin_after_placement = run.sky_coin;
+
+        let outcome = run.demolish_tile(TileCoord::new(0, -1)).unwrap();
+
+        assert_eq!(
+            outcome,
+            DemolitionOutcome::Road {
+                coord: TileCoord::new(0, -1)
+            }
+        );
+        assert!(!run.roads.contains_key(&TileCoord::new(0, -1)));
+        assert_eq!(run.sky_coin, sky_coin_after_placement);
+    }
+
+    #[test]
+    fn demolish_removes_non_city_core_buildings_without_refund() {
+        let mut run = RunState::start(7);
+        let origin = valid_unoccupied_building_origin(&run);
+        let id = run.place_building(BuildingKind::House, origin).unwrap();
+        let sky_coin_after_placement = run.sky_coin;
+
+        let outcome = run.demolish_tile(origin).unwrap();
+
+        assert_eq!(
+            outcome,
+            DemolitionOutcome::Building {
+                id,
+                kind: BuildingKind::House,
+            }
+        );
+        assert!(run.buildings.iter().all(|building| building.id != id));
+        assert_eq!(run.sky_coin, sky_coin_after_placement);
+    }
+
+    #[test]
+    fn demolish_rejects_city_core() {
+        let mut run = RunState::start(7);
+
+        let result = run.demolish_tile(TileCoord::new(0, 0));
+
+        assert_eq!(result, Err("City Core cannot be demolished".to_owned()));
+        assert!(
+            run.buildings
+                .iter()
+                .any(|building| building.kind == BuildingKind::CityCore)
+        );
+    }
+
+    #[test]
+    fn demolition_can_disconnect_roads_and_buildings() {
+        let mut run = RunState::start(7);
+        run.place_road_path(&[
+            TileCoord::new(0, -1),
+            TileCoord::new(0, -2),
+            TileCoord::new(0, -3),
+        ])
+        .unwrap();
+        let connected_origin = valid_building_origin_adjacent_to_road(&run, TileCoord::new(0, -3));
+        let connected_id = run
+            .place_building(BuildingKind::Farm, connected_origin)
+            .unwrap();
+        assert!(run.is_road_connected(TileCoord::new(0, -3)));
+        assert!(run.is_building_active(connected_id));
+
+        run.demolish_tile(TileCoord::new(0, -2)).unwrap();
+
+        assert!(!run.is_road_connected(TileCoord::new(0, -3)));
+        assert!(!run.is_building_active(connected_id));
+    }
+
+    #[test]
+    fn bankrupt_run_rejects_placement_and_demolition() {
+        let mut run = RunState::start(7);
+        run.place_road_path(&[TileCoord::new(0, -1)]).unwrap();
+        let origin = valid_unoccupied_building_origin(&run);
+        run.status = RunStatus::Bankrupt;
+
+        let building_result = run.place_building(BuildingKind::House, origin);
+        let road_result = run.place_road_path(&[TileCoord::new(0, -2)]);
+        let demolish_result = run.demolish_tile(TileCoord::new(0, -1));
+
+        assert_eq!(building_result, Err("Run is bankrupt".to_owned()));
+        assert_eq!(road_result, Err("Run is bankrupt".to_owned()));
+        assert_eq!(demolish_result, Err("Run is bankrupt".to_owned()));
+        assert!(run.roads.contains_key(&TileCoord::new(0, -1)));
+    }
+
     fn valid_unoccupied_building_origin(run: &RunState) -> TileCoord {
         run.islands
             .iter()
@@ -845,6 +981,32 @@ mod road_tests {
                 footprint_is_valid && touches_connected_road
             })
             .expect("generated island should have a valid footprint next to the connected Road")
+    }
+
+    fn valid_building_origin_adjacent_to_road(run: &RunState, road_coord: TileCoord) -> TileCoord {
+        run.islands
+            .iter()
+            .flat_map(|island| island.tiles())
+            .map(|tile| tile.coord)
+            .find(|origin| {
+                let footprint = building_footprint(*origin);
+                let Some(first_height) = run.tile_height(footprint[0]) else {
+                    return false;
+                };
+
+                let footprint_is_valid = footprint.iter().all(|coord| {
+                    run.tile_height(*coord) == Some(first_height)
+                        && !run.is_occupied(*coord)
+                        && !run.roads.contains_key(coord)
+                });
+                let touches_road = footprint
+                    .into_iter()
+                    .flat_map(orthogonal_neighbors)
+                    .any(|coord| coord == road_coord);
+
+                footprint_is_valid && touches_road
+            })
+            .expect("generated island should have a valid footprint next to the target Road")
     }
 
     fn insert_existing_connected_road_chain_to(run: &mut RunState, target: TileCoord) {

@@ -1,4 +1,4 @@
-use crate::simulation::{BuildingId, BuildingKind, GameState, RunState};
+use crate::simulation::{BuildingId, BuildingKind, DemolitionOutcome, GameState, RunState};
 use crate::world::TileCoord;
 use std::error::Error;
 use std::fmt::{Display, Formatter};
@@ -87,13 +87,23 @@ impl GameState {
                     .map(|coords| CommandOutcome::RoadPathPlaced { coords })
                     .map_err(CommandError::PlacementRejected)
             }
-            Command::DemolishTile { coord: _ } => Err(CommandError::PlacementRejected({
-                self.current_run
-                    .as_ref()
+            Command::DemolishTile { coord } => {
+                let run = self
+                    .current_run
+                    .as_mut()
                     .ok_or(CommandError::NoRunStarted)?;
-                "Demolition is not implemented yet".to_owned()
-            })),
+                run.demolish_tile(coord)
+                    .map(command_outcome_from_demolition)
+                    .map_err(CommandError::PlacementRejected)
+            }
         }
+    }
+}
+
+fn command_outcome_from_demolition(outcome: DemolitionOutcome) -> CommandOutcome {
+    match outcome {
+        DemolitionOutcome::Road { coord } => CommandOutcome::RoadDemolished { coord },
+        DemolitionOutcome::Building { id, kind } => CommandOutcome::BuildingDemolished { id, kind },
     }
 }
 
@@ -159,19 +169,27 @@ mod tests {
     }
 
     #[test]
-    fn demolition_command_exists_but_is_not_implemented_yet() {
+    fn demolish_tile_returns_a_command_outcome() {
         let mut game = GameState::empty();
         game.apply(Command::StartRun { seed: 7 }).unwrap();
+        let origin = valid_unoccupied_building_origin(game.current_run.as_ref().unwrap());
+        let placed = game
+            .apply(Command::PlaceBuilding {
+                kind: BuildingKind::House,
+                origin,
+            })
+            .unwrap();
+        assert_eq!(placed, CommandOutcome::BuildingPlaced { id: BuildingId(1) });
 
-        let demolish_result = game.apply(Command::DemolishTile {
-            coord: TileCoord::new(2, 0),
-        });
+        let demolish_result = game.apply(Command::DemolishTile { coord: origin }).unwrap();
 
-        assert!(matches!(
+        assert_eq!(
             demolish_result,
-            Err(CommandError::PlacementRejected(reason))
-            if reason == "Demolition is not implemented yet"
-        ));
+            CommandOutcome::BuildingDemolished {
+                id: BuildingId(1),
+                kind: BuildingKind::House,
+            }
+        );
     }
 
     #[test]
