@@ -1,5 +1,6 @@
 use crate::world::{FlyingIsland, TileCoord};
 use serde::{Deserialize, Serialize};
+use std::collections::BTreeMap;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 pub struct BuildingId(pub u32);
@@ -19,6 +20,12 @@ pub struct Building {
     pub id: BuildingId,
     pub kind: BuildingKind,
     pub origin: TileCoord,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Road {
+    pub coord: TileCoord,
+    pub height: i32,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -47,6 +54,8 @@ pub struct RunState {
     pub food: FoodStock,
     pub islands: Vec<FlyingIsland>,
     pub buildings: Vec<Building>,
+    #[serde(with = "road_map_serde")]
+    pub roads: BTreeMap<TileCoord, Road>,
     pub next_building_id: u32,
     sky_coin_drain_remainder: f64,
     food_remainder: f64,
@@ -85,10 +94,21 @@ impl RunState {
                 kind: BuildingKind::CityCore,
                 origin: TileCoord::new(0, 0),
             }],
+            roads: BTreeMap::new(),
             next_building_id: 1,
             sky_coin_drain_remainder: 0.0,
             food_remainder: 0.0,
         }
+    }
+
+    pub fn road_kind_at(&self, coord: TileCoord) -> Option<RoadKind> {
+        self.roads.get(&coord).map(|_| {
+            if self.tile_height(coord).is_some() {
+                RoadKind::Island
+            } else {
+                RoadKind::Sky
+            }
+        })
     }
 
     pub fn tick(&mut self) {
@@ -164,6 +184,12 @@ impl RunState {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RoadKind {
+    Island,
+    Sky,
+}
+
 pub fn building_footprint(origin: TileCoord) -> [TileCoord; 4] {
     [
         origin,
@@ -171,4 +197,97 @@ pub fn building_footprint(origin: TileCoord) -> [TileCoord; 4] {
         TileCoord::new(origin.x, origin.z + 1),
         TileCoord::new(origin.x + 1, origin.z + 1),
     ]
+}
+
+mod road_map_serde {
+    use super::Road;
+    use crate::world::TileCoord;
+    use serde::{Deserialize, Deserializer, Serialize, Serializer};
+    use std::collections::BTreeMap;
+
+    pub fn serialize<S>(roads: &BTreeMap<TileCoord, Road>, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        roads.values().collect::<Vec<_>>().serialize(serializer)
+    }
+
+    pub fn deserialize<'de, D>(deserializer: D) -> Result<BTreeMap<TileCoord, Road>, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let roads = Vec::<Road>::deserialize(deserializer)?;
+        Ok(roads.into_iter().map(|road| (road.coord, road)).collect())
+    }
+}
+
+#[cfg(test)]
+mod road_tests {
+    use super::*;
+
+    #[test]
+    fn run_state_stores_roads_in_deterministic_tile_order() {
+        let mut run = RunState::start(7);
+
+        run.roads.insert(
+            TileCoord::new(2, 0),
+            Road {
+                coord: TileCoord::new(2, 0),
+                height: 1,
+            },
+        );
+        run.roads.insert(
+            TileCoord::new(-1, 4),
+            Road {
+                coord: TileCoord::new(-1, 4),
+                height: 0,
+            },
+        );
+        run.roads.insert(
+            TileCoord::new(2, -1),
+            Road {
+                coord: TileCoord::new(2, -1),
+                height: 1,
+            },
+        );
+
+        let ordered_coords = run.roads.keys().copied().collect::<Vec<_>>();
+
+        assert_eq!(
+            ordered_coords,
+            vec![
+                TileCoord::new(-1, 4),
+                TileCoord::new(2, -1),
+                TileCoord::new(2, 0),
+            ]
+        );
+    }
+
+    #[test]
+    fn road_kind_is_derived_from_the_world_tile() {
+        let mut run = RunState::start(7);
+        let island_coord = TileCoord::new(0, 2);
+        let empty_coord = TileCoord::new(20, 20);
+
+        let island_height = run
+            .tile_height(island_coord)
+            .expect("test coordinate should be on the generated island");
+        run.roads.insert(
+            island_coord,
+            Road {
+                coord: island_coord,
+                height: island_height,
+            },
+        );
+        run.roads.insert(
+            empty_coord,
+            Road {
+                coord: empty_coord,
+                height: island_height,
+            },
+        );
+
+        assert_eq!(run.road_kind_at(island_coord), Some(RoadKind::Island));
+        assert_eq!(run.road_kind_at(empty_coord), Some(RoadKind::Sky));
+    }
 }
