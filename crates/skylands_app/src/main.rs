@@ -1,22 +1,24 @@
 use macroquad::camera::Camera;
 use macroquad::prelude::*;
 use skylands_core::{
-    BuildingKind, Command, CommandError, CommandOutcome, GameState, Road, RoadKind, RunState,
-    RunStatus, TileCoord,
+    BuildingKind, Command, CommandError, CommandOutcome, GameState, InvalidPlacement, Road,
+    RoadKind, RunSave, RunState, RunStatus, SaveStateV1, TileCoord,
 };
 
+const SAVE_FILE: &str = "skylands-save.json";
 const TILE_SIZE: f32 = 1.0;
 const TILE_HEIGHT: f32 = 0.25;
 const ROAD_HEIGHT: f32 = 0.06;
 const MAX_CATCH_UP_TICKS: u32 = 3;
 const EMPTY_TILE_PICK_COORD_LIMIT: i32 = 32;
 const TOOLBAR_HEIGHT: f32 = 76.0;
+const TOP_BAR_HEIGHT: f32 = 40.0;
+const COMMAND_BANNER_SECONDS: f32 = 1.5;
+const CURSOR_TOOLTIP_MAX_LINES: usize = 3;
 
 #[macroquad::main(window_conf)]
 async fn main() {
-    let mut game = GameState::empty();
-    game.apply(Command::StartRun { seed: 1 })
-        .expect("initial Run should start");
+    let mut game = load_or_start_game();
 
     let mut camera = CityCamera::default();
     let mut ui = AppUi::default();
@@ -26,7 +28,13 @@ async fn main() {
         clear_background(Color::from_rgba(139, 198, 218, 255));
 
         let frame_time = get_frame_time();
-        tick_accumulator += frame_time;
+        if game
+            .current_run
+            .as_ref()
+            .is_some_and(|run| run.status == RunStatus::Running)
+        {
+            tick_accumulator += frame_time;
+        }
         let mut catch_up_ticks = 0;
 
         while tick_accumulator >= 1.0 && catch_up_ticks < MAX_CATCH_UP_TICKS {
@@ -38,37 +46,78 @@ async fn main() {
         if catch_up_ticks == MAX_CATCH_UP_TICKS {
             tick_accumulator = 0.0;
         }
+        if catch_up_ticks > 0 {
+            persist_game(&game);
+        }
 
+        ui.update(frame_time);
         camera.update();
-        handle_tool_hotkeys(&mut ui);
+        handle_global_hotkeys(&mut game, &mut ui);
 
         let hovered_tile = {
             let run = game.current_run.as_ref().expect("Run should exist");
             pick_tile(run, &camera)
         };
         let pointer_over_toolbar = toolbar_rect().contains(mouse_vec());
+        let hovered_world_tile = if pointer_over_toolbar {
+            None
+        } else {
+            hovered_tile
+        };
 
         handle_toolbar_mouse(&mut ui);
         let run_status = game.current_run.as_ref().expect("Run should exist").status;
         handle_world_input(
             &mut game,
             &mut ui,
-            hovered_tile,
+            hovered_world_tile,
             pointer_over_toolbar,
             run_status,
         );
 
         let run = game.current_run.as_ref().expect("Run should exist");
-        let preview = Preview::from_state(run, &ui, hovered_tile);
+        let preview = Preview::from_state(run, &ui, hovered_world_tile);
 
         set_camera(&camera.to_macroquad());
-        draw_run(run, hovered_tile, &preview);
+        draw_run(run, hovered_world_tile, &preview);
         set_default_camera();
 
-        draw_hud(run, hovered_tile, &ui, &preview);
+        draw_hud(run, hovered_world_tile, &ui, &preview);
         draw_toolbar(run, ui.selected_tool);
 
         next_frame().await;
+    }
+}
+
+fn load_or_start_game() -> GameState {
+    if let Ok(json) = std::fs::read_to_string(SAVE_FILE)
+        && let Ok(save) = SaveStateV1::from_json(&json)
+    {
+        let game = GameState::from(save);
+        if game.current_run.is_some() {
+            return game;
+        }
+    }
+
+    let mut game = GameState::empty();
+    game.apply(Command::StartRun { seed: 1 })
+        .expect("initial Run should start");
+    persist_game(&game);
+    game
+}
+
+fn persist_game(game: &GameState) {
+    if cfg!(test) {
+        return;
+    }
+
+    let save = SaveStateV1 {
+        current_run: game.current_run.as_ref().map(RunSave::from),
+        ..SaveStateV1::empty()
+    };
+
+    if let Ok(json) = save.to_json() {
+        let _ = std::fs::write(SAVE_FILE, json);
     }
 }
 
@@ -86,7 +135,7 @@ fn window_conf() -> Conf {
 struct AppUi {
     selected_tool: Tool,
     road_drag: Option<RoadDrag>,
-    last_message: String,
+    command_banner: Option<CommandBanner>,
 }
 
 impl Default for AppUi {
@@ -94,9 +143,37 @@ impl Default for AppUi {
         Self {
             selected_tool: Tool::Road,
             road_drag: None,
-            last_message: "Select a tool or inspect a tile".to_owned(),
+            command_banner: None,
         }
     }
+}
+
+impl AppUi {
+    fn update(&mut self, frame_time: f32) {
+        if let Some(banner) = &mut self.command_banner {
+            banner.remaining_seconds -= frame_time;
+            if banner.remaining_seconds <= 0.0 {
+                self.command_banner = None;
+            }
+        }
+    }
+
+    fn show_command_error(&mut self, text: String) {
+        self.command_banner = Some(CommandBanner {
+            text,
+            remaining_seconds: COMMAND_BANNER_SECONDS,
+        });
+    }
+
+    fn clear_command_banner(&mut self) {
+        self.command_banner = None;
+    }
+}
+
+#[derive(Debug, Clone)]
+struct CommandBanner {
+    text: String,
+    remaining_seconds: f32,
 }
 
 #[derive(Debug, Clone)]
@@ -157,14 +234,14 @@ enum Preview {
         footprint: [TileCoord; 4],
         valid: bool,
         cost: i64,
-        reason: Option<String>,
+        reason: Option<InvalidPlacement>,
     },
     Road {
         tiles: Vec<TileCoord>,
         new_roads: Vec<Road>,
         valid: bool,
         cost: i64,
-        reason: Option<String>,
+        reason: Option<InvalidPlacement>,
     },
 }
 
@@ -191,7 +268,7 @@ impl Preview {
                     return Self::None;
                 };
 
-                let quote = run.quote_road_path(&tiles);
+                let quote = run.quote_roads(&tiles);
                 Self::Road {
                     tiles: quote.tiles,
                     new_roads: quote.new_roads,
@@ -204,7 +281,7 @@ impl Preview {
         }
     }
 
-    fn status_line(&self) -> Option<String> {
+    fn quote_line(&self) -> Option<String> {
         match self {
             Self::None => None,
             Self::Building {
@@ -213,7 +290,7 @@ impl Preview {
                 reason,
                 ..
             } => Some(format!(
-                "Building cost: {cost} SkyCoin | {}",
+                "Building: {cost} SkyCoin, {}",
                 validity_text(*valid, reason)
             )),
             Self::Road {
@@ -222,18 +299,21 @@ impl Preview {
                 reason,
                 ..
             } => Some(format!(
-                "Road path cost: {cost} SkyCoin | {}",
+                "Road: {cost} SkyCoin, {}",
                 validity_text(*valid, reason)
             )),
         }
     }
 }
 
-fn validity_text(valid: bool, reason: &Option<String>) -> String {
+fn validity_text(valid: bool, reason: &Option<InvalidPlacement>) -> String {
     if valid {
         "valid".to_owned()
     } else {
-        reason.clone().unwrap_or_else(|| "invalid".to_owned())
+        reason
+            .map(InvalidPlacement::message)
+            .unwrap_or("invalid")
+            .to_owned()
     }
 }
 
@@ -302,7 +382,11 @@ impl CityCamera {
     }
 }
 
-fn handle_tool_hotkeys(ui: &mut AppUi) {
+fn handle_global_hotkeys(game: &mut GameState, ui: &mut AppUi) {
+    if is_key_pressed(KeyCode::P) || is_key_pressed(KeyCode::Space) {
+        apply_command_to_ui(game, ui, Command::TogglePause, |_| {});
+    }
+
     for (index, tool) in TOOLS.iter().enumerate() {
         if is_key_pressed(number_key(index)) {
             ui.selected_tool = *tool;
@@ -355,9 +439,7 @@ fn handle_world_input(
                 && is_mouse_button_pressed(MouseButton::Left)
                 && let Some(origin) = hovered_tile
             {
-                apply_command_to_ui(game, ui, Command::PlaceBuilding { kind, origin }, |_| {
-                    format!("Placed {}", building_kind_name(kind))
-                });
+                apply_command_to_ui(game, ui, Command::PlaceBuilding { kind, origin }, |_| {});
             }
         }
         Tool::Road => handle_road_input(game, ui, hovered_tile, pointer_over_toolbar),
@@ -366,12 +448,7 @@ fn handle_world_input(
                 && is_mouse_button_pressed(MouseButton::Left)
                 && let Some(coord) = hovered_tile
             {
-                apply_command_to_ui(
-                    game,
-                    ui,
-                    Command::DemolishTile { coord },
-                    command_outcome_text,
-                );
+                apply_command_to_ui(game, ui, Command::DemolishTile { coord }, |_| {});
             }
         }
     }
@@ -400,12 +477,7 @@ fn handle_road_input(
     if is_mouse_button_released(MouseButton::Left)
         && let Some(drag) = ui.road_drag.take()
     {
-        apply_command_to_ui(
-            game,
-            ui,
-            Command::PlaceRoadPath { path: drag.tiles },
-            command_outcome_text,
-        );
+        apply_command_to_ui(game, ui, Command::PlaceRoads { coords: drag.tiles }, |_| {});
     }
 }
 
@@ -413,35 +485,21 @@ fn apply_command_to_ui(
     game: &mut GameState,
     ui: &mut AppUi,
     command: Command,
-    success_message: impl FnOnce(CommandOutcome) -> String,
+    on_success: impl FnOnce(CommandOutcome),
 ) {
     match game.apply(command) {
-        Ok(outcome) => ui.last_message = success_message(outcome),
-        Err(error) => ui.last_message = command_error_text(error),
-    }
-}
-
-fn command_outcome_text(outcome: CommandOutcome) -> String {
-    match outcome {
-        CommandOutcome::RunStarted => "Run started".to_owned(),
-        CommandOutcome::Ticked => "Run advanced".to_owned(),
-        CommandOutcome::BuildingPlaced { .. } => "Building placed".to_owned(),
-        CommandOutcome::RoadPathPlaced { coords } => {
-            let tile_text = if coords.len() == 1 { "tile" } else { "tiles" };
-            format!("Placed {} Road {tile_text}", coords.len())
+        Ok(outcome) => {
+            ui.clear_command_banner();
+            on_success(outcome);
+            persist_game(game);
         }
-        CommandOutcome::RoadDemolished { coord } => {
-            format!("Demolished Road at ({}, {})", coord.x, coord.z)
-        }
-        CommandOutcome::BuildingDemolished { kind, .. } => {
-            format!("Demolished {}", building_kind_name(kind))
-        }
+        Err(error) => ui.show_command_error(command_error_text(error)),
     }
 }
 
 fn command_error_text(error: CommandError) -> String {
     match error {
-        CommandError::PlacementRejected(reason) => reason,
+        CommandError::InvalidPlacement(reason) => reason.message().to_owned(),
         other => other.to_string(),
     }
 }
@@ -695,40 +753,155 @@ fn ray_box_distance(origin: Vec3, direction: Vec3, min: Vec3, max: Vec3) -> Opti
 }
 
 fn draw_hud(run: &RunState, hovered_tile: Option<TileCoord>, ui: &AppUi, preview: &Preview) {
-    let mut lines = vec![
-        format!("Run time: {}s", run.elapsed_seconds),
-        format!("SkyCoin: {}", run.sky_coin),
-        format!("SkyCoin drain: -{:.1}/s", run.sky_coin_drain_per_second),
-        format!("Tax Income: +{:.1}/s", sky_coin_tax_income_per_second(run)),
-        format!("Net SkyCoin: {:+.1}/s", sky_coin_net_per_second(run)),
-        format!("Food: {}/{}", run.food.current, run.food.cap),
-        format!("Food production: +{:.1}/s", run.food.production_per_second),
-        format!(
-            "Food consumption: -{:.1}/s",
-            run.food.consumption_per_second
-        ),
-        format!("Net Food: {:+.1}/s", food_net_per_second(run)),
-        format!("Citizens: {}/{}", run.citizens, run.citizen_capacity),
-        format!("Tool: {}", tool_name(ui.selected_tool)),
-    ];
+    draw_top_bar(run);
+    draw_command_banner(ui.command_banner.as_ref());
+    draw_cursor_tooltip(cursor_tooltip_lines(
+        preview.quote_line(),
+        inspect_tile(run, hovered_tile),
+    ));
+}
 
-    if let Some(line) = preview.status_line() {
-        lines.push(line);
+fn draw_top_bar(run: &RunState) {
+    draw_rectangle(
+        0.0,
+        0.0,
+        screen_width(),
+        TOP_BAR_HEIGHT,
+        Color::from_rgba(23, 29, 33, 232),
+    );
+
+    let y = 26.0;
+    let resource_color = Color::from_rgba(238, 242, 244, 255);
+    let sky_coin = format!(
+        "SkyCoin {} {:+.1}/s",
+        run.sky_coin,
+        sky_coin_net_per_second(run)
+    );
+    let food = format!(
+        "Food {}/{} {:+.1}/s",
+        run.food.current,
+        run.food.cap,
+        food_net_per_second(run)
+    );
+    let citizens = format!("Citizens {}/{}", run.citizens, run.citizen_capacity);
+
+    draw_text(&sky_coin, 18.0, y, 20.0, resource_color);
+    draw_text(&food, 210.0, y, 20.0, resource_color);
+    draw_text(&citizens, 390.0, y, 20.0, resource_color);
+
+    let time = format_run_time(run.elapsed_seconds);
+    let status = match run.status {
+        RunStatus::Running => time,
+        RunStatus::Paused => format!("{time} Paused"),
+        RunStatus::Bankrupt => format!("{time} Bankrupt"),
+    };
+    let time_size = measure_text(&status, None, 20, 1.0);
+    draw_text(
+        &status,
+        screen_width() - time_size.width - 24.0,
+        y,
+        20.0,
+        resource_color,
+    );
+}
+
+fn draw_command_banner(banner: Option<&CommandBanner>) {
+    let Some(banner) = banner else {
+        return;
+    };
+
+    let font_size = 20;
+    let padding = vec2(18.0, 9.0);
+    let text_size = measure_text(&banner.text, None, font_size, 1.0);
+    let width = text_size.width + padding.x * 2.0;
+    let height = TOP_BAR_HEIGHT - 4.0;
+    let x = (screen_width() - width) * 0.5;
+    let y = TOP_BAR_HEIGHT + 10.0;
+
+    draw_rectangle(x, y, width, height, Color::from_rgba(112, 33, 36, 232));
+    draw_rectangle_lines(
+        x,
+        y,
+        width,
+        height,
+        2.0,
+        Color::from_rgba(246, 157, 148, 255),
+    );
+    draw_text(
+        &banner.text,
+        x + padding.x,
+        y + 24.0,
+        font_size as f32,
+        WHITE,
+    );
+}
+
+fn cursor_tooltip_lines(quote: Option<String>, inspection: Option<String>) -> Vec<String> {
+    quote
+        .into_iter()
+        .chain(inspection)
+        .take(CURSOR_TOOLTIP_MAX_LINES)
+        .collect()
+}
+
+fn draw_cursor_tooltip(lines: Vec<String>) {
+    if lines.is_empty() {
+        return;
     }
 
-    lines.push(format!("Message: {}", ui.last_message));
+    let font_size = 18;
+    let line_height = 22.0;
+    let padding = vec2(12.0, 9.0);
+    let max_width = lines
+        .iter()
+        .map(|line| measure_text(line, None, font_size, 1.0).width)
+        .fold(0.0, f32::max);
+    let width = max_width + padding.x * 2.0;
+    let height = padding.y * 2.0 + line_height * lines.len() as f32;
+    let mouse = mouse_vec();
+    let position = clamp_tooltip_position(mouse + vec2(18.0, 18.0), vec2(width, height));
 
-    if let Some(inspection) = inspect_tile(run, hovered_tile) {
-        lines.push(inspection);
-    }
-
-    let panel_color = Color::from_rgba(23, 29, 33, 220);
-    let panel_height = 32.0 + lines.len() as f32 * 24.0;
-    draw_rectangle(16.0, 16.0, 440.0, panel_height, panel_color);
+    draw_rectangle(
+        position.x,
+        position.y,
+        width,
+        height,
+        Color::from_rgba(23, 29, 33, 226),
+    );
+    draw_rectangle_lines(
+        position.x,
+        position.y,
+        width,
+        height,
+        1.0,
+        Color::from_rgba(218, 223, 228, 180),
+    );
 
     for (index, line) in lines.iter().enumerate() {
-        draw_text(line, 32.0, 48.0 + index as f32 * 24.0, 20.0, WHITE);
+        draw_text(
+            line,
+            position.x + padding.x,
+            position.y + padding.y + 17.0 + index as f32 * line_height,
+            font_size as f32,
+            WHITE,
+        );
     }
+}
+
+fn clamp_tooltip_position(position: Vec2, size: Vec2) -> Vec2 {
+    let margin = 8.0;
+    vec2(
+        position.x.clamp(margin, screen_width() - size.x - margin),
+        position
+            .y
+            .clamp(TOP_BAR_HEIGHT + margin, screen_height() - size.y - margin),
+    )
+}
+
+fn format_run_time(seconds: u64) -> String {
+    let minutes = seconds / 60;
+    let seconds = seconds % 60;
+    format!("Run {minutes:02}:{seconds:02}")
 }
 
 fn sky_coin_tax_income_per_second(_run: &RunState) -> f64 {
@@ -919,6 +1092,53 @@ mod tests {
                 TileCoord::new(0, 0),
                 TileCoord::new(1, 0),
                 TileCoord::new(2, 0),
+            ]
+        );
+    }
+
+    #[test]
+    fn command_banner_expires_after_timeout() {
+        let mut ui = AppUi::default();
+
+        ui.show_command_error("Not enough SkyCoin".to_owned());
+        ui.update(COMMAND_BANNER_SECONDS - 0.1);
+        assert!(ui.command_banner.is_some());
+
+        ui.update(0.11);
+        assert!(ui.command_banner.is_none());
+    }
+
+    #[test]
+    fn successful_command_clears_existing_command_banner() {
+        let mut game = GameState::empty();
+        game.apply(Command::StartRun { seed: 7 }).unwrap();
+        let mut ui = AppUi::default();
+        ui.show_command_error("Previous failure".to_owned());
+
+        apply_command_to_ui(
+            &mut game,
+            &mut ui,
+            Command::PlaceRoads {
+                coords: vec![TileCoord::new(0, -1)],
+            },
+            |_| {},
+        );
+
+        assert!(ui.command_banner.is_none());
+    }
+
+    #[test]
+    fn cursor_tooltip_prioritizes_quote_before_inspection() {
+        let lines = cursor_tooltip_lines(
+            Some("Road: 2 SkyCoin, valid".to_owned()),
+            Some("Inspect: tile (0, 0)".to_owned()),
+        );
+
+        assert_eq!(
+            lines,
+            vec![
+                "Road: 2 SkyCoin, valid".to_owned(),
+                "Inspect: tile (0, 0)".to_owned(),
             ]
         );
     }
