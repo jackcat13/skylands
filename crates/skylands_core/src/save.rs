@@ -1,4 +1,4 @@
-use crate::simulation::{Building, FoodStock, Road, RunState, RunStatus};
+use crate::simulation::{Building, FoodStock, GameState, Road, RunState, RunStatus};
 use crate::world::FlyingIsland;
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
@@ -85,6 +85,39 @@ impl From<&RunState> for RunSaveV1 {
     }
 }
 
+impl From<RunSaveV1> for RunState {
+    fn from(save: RunSaveV1) -> Self {
+        let roads = save
+            .roads
+            .into_iter()
+            .map(|road| (road.coord, road))
+            .collect();
+
+        RunState::restored(
+            save.seed,
+            save.status,
+            save.elapsed_seconds,
+            save.sky_coin,
+            save.sky_coin_drain_per_second,
+            save.citizens,
+            save.citizen_capacity,
+            save.food,
+            save.islands,
+            save.buildings,
+            roads,
+            save.next_building_id,
+        )
+    }
+}
+
+impl From<SaveStateV1> for GameState {
+    fn from(save: SaveStateV1) -> Self {
+        Self {
+            current_run: save.current_run.map(RunState::from),
+        }
+    }
+}
+
 pub type SaveState = SaveStateV1;
 pub type RunSave = RunSaveV1;
 pub type SaveEnvelopeV1 = BTreeMap<String, serde_json::Value>;
@@ -148,5 +181,22 @@ mod tests {
                 },
             ]
         );
+    }
+
+    #[test]
+    fn save_state_restores_current_run_without_advancing_time() {
+        let mut run = RunState::start(10);
+        run.elapsed_seconds = 42;
+        run.place_roads(&[TileCoord::new(0, -1)]).unwrap();
+        let save = SaveStateV1 {
+            current_run: Some(RunSaveV1::from(&run)),
+            ..SaveStateV1::empty()
+        };
+
+        let restored = GameState::from(save);
+        let restored_run = restored.current_run.unwrap();
+
+        assert_eq!(restored_run.elapsed_seconds, 42);
+        assert!(restored_run.roads.contains_key(&TileCoord::new(0, -1)));
     }
 }

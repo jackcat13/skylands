@@ -5,6 +5,11 @@ use std::collections::{BTreeMap, BTreeSet, VecDeque};
 pub const ISLAND_ROAD_COST: i64 = 2;
 pub const SKY_ROAD_COST: i64 = 8;
 const BUILDING_COST_MULTIPLIER: f64 = 1.15;
+const CITY_CORE_CITIZEN_CAPACITY: u32 = 5;
+const HOUSE_CITIZEN_CAPACITY: u32 = 6;
+const FARM_FOOD_PRODUCTION_PER_SECOND: f64 = 2.0;
+const FOOD_CONSUMPTION_PER_CITIZEN: f64 = 0.1;
+const CITIZEN_ARRIVAL_PER_SECOND: f64 = 1.0;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 pub struct BuildingId(pub u32);
@@ -37,16 +42,59 @@ pub struct BuildingQuote {
     pub valid: bool,
     pub cost: i64,
     pub footprint: [TileCoord; 4],
-    pub invalid_reason: Option<String>,
+    pub invalid_reason: Option<InvalidPlacement>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct RoadPathQuote {
+pub struct RoadPlacementQuote {
     pub valid: bool,
     pub total_cost: i64,
     pub tiles: Vec<TileCoord>,
     pub new_roads: Vec<Road>,
-    pub invalid_reason: Option<String>,
+    pub invalid_reason: Option<InvalidPlacement>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum InvalidPlacement {
+    CityCoreIsFixed,
+    NotEnoughSkyCoin,
+    BuildingFootprintMustBeOnFlyingIsland,
+    BuildingFootprintMustBeBuildableAndOneHeight,
+    BuildingFootprintIsOccupied,
+    BuildingFootprintContainsRoad,
+    RoadPlacementIsEmpty,
+    RoadPlacementMustBeOrthogonallyContinuous,
+    RoadHeightDifferenceTooSteep,
+    RoadCannotOverlapBuilding,
+    RunIsNotEditable,
+    NothingToDemolish,
+    CityCoreCannotBeDemolished,
+}
+
+impl InvalidPlacement {
+    pub fn message(self) -> &'static str {
+        match self {
+            Self::CityCoreIsFixed => "City Core is fixed and unique",
+            Self::NotEnoughSkyCoin => "Not enough SkyCoin",
+            Self::BuildingFootprintMustBeOnFlyingIsland => {
+                "Building footprint must be on a Flying Island"
+            }
+            Self::BuildingFootprintMustBeBuildableAndOneHeight => {
+                "Building footprint must be buildable and at one height"
+            }
+            Self::BuildingFootprintIsOccupied => "Building footprint is occupied",
+            Self::BuildingFootprintContainsRoad => "Building footprint contains a Road",
+            Self::RoadPlacementIsEmpty => "Road placement is empty",
+            Self::RoadPlacementMustBeOrthogonallyContinuous => {
+                "Road placement must be orthogonally continuous"
+            }
+            Self::RoadHeightDifferenceTooSteep => "Road height difference is too steep",
+            Self::RoadCannotOverlapBuilding => "Road cannot overlap a Building",
+            Self::RunIsNotEditable => "Run is not editable",
+            Self::NothingToDemolish => "Nothing to demolish",
+            Self::CityCoreCannotBeDemolished => "City Core cannot be demolished",
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -58,6 +106,7 @@ pub enum DemolitionOutcome {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum RunStatus {
     Running,
+    Paused,
     Bankrupt,
 }
 
@@ -108,7 +157,7 @@ impl RunState {
             sky_coin: 500,
             sky_coin_drain_per_second: 1.0,
             citizens: 0,
-            citizen_capacity: 5,
+            citizen_capacity: CITY_CORE_CITIZEN_CAPACITY,
             food: FoodStock {
                 current: 20,
                 cap: 50,
@@ -123,6 +172,38 @@ impl RunState {
             }],
             roads: BTreeMap::new(),
             next_building_id: 1,
+            sky_coin_drain_remainder: 0.0,
+            food_remainder: 0.0,
+        }
+    }
+
+    pub(crate) fn restored(
+        seed: u64,
+        status: RunStatus,
+        elapsed_seconds: u64,
+        sky_coin: i64,
+        sky_coin_drain_per_second: f64,
+        citizens: u32,
+        citizen_capacity: u32,
+        food: FoodStock,
+        islands: Vec<FlyingIsland>,
+        buildings: Vec<Building>,
+        roads: BTreeMap<TileCoord, Road>,
+        next_building_id: u32,
+    ) -> Self {
+        Self {
+            seed,
+            status,
+            elapsed_seconds,
+            sky_coin,
+            sky_coin_drain_per_second,
+            citizens,
+            citizen_capacity,
+            food,
+            islands,
+            buildings,
+            roads,
+            next_building_id,
             sky_coin_drain_remainder: 0.0,
             food_remainder: 0.0,
         }
@@ -144,12 +225,22 @@ impl RunState {
         }
 
         self.elapsed_seconds += 1;
+        self.recalculate_city_outputs();
         self.apply_sky_coin_drain();
+        self.apply_citizen_arrivals();
         self.apply_food_delta();
 
         if self.sky_coin <= 0 {
             self.status = RunStatus::Bankrupt;
         }
+    }
+
+    pub fn toggle_pause(&mut self) {
+        self.status = match self.status {
+            RunStatus::Running => RunStatus::Paused,
+            RunStatus::Paused => RunStatus::Running,
+            RunStatus::Bankrupt => RunStatus::Bankrupt,
+        };
     }
 
     pub fn tile_height(&self, coord: TileCoord) -> Option<i32> {
@@ -183,22 +274,18 @@ impl RunState {
         let cost = self.building_cost(kind);
 
         if kind == BuildingKind::CityCore {
-            return invalid_building_quote(
-                cost,
-                footprint,
-                "City Core is fixed and unique".to_owned(),
-            );
+            return invalid_building_quote(cost, footprint, InvalidPlacement::CityCoreIsFixed);
         }
 
         if self.sky_coin < cost {
-            return invalid_building_quote(cost, footprint, "Not enough SkyCoin".to_owned());
+            return invalid_building_quote(cost, footprint, InvalidPlacement::NotEnoughSkyCoin);
         }
 
         let Some(first_height) = self.tile_height(footprint[0]) else {
             return invalid_building_quote(
                 cost,
                 footprint,
-                "Building footprint must be on a Flying Island".to_owned(),
+                InvalidPlacement::BuildingFootprintMustBeOnFlyingIsland,
             );
         };
 
@@ -207,7 +294,7 @@ impl RunState {
                 return invalid_building_quote(
                     cost,
                     footprint,
-                    "Building footprint must be buildable and at one height".to_owned(),
+                    InvalidPlacement::BuildingFootprintMustBeBuildableAndOneHeight,
                 );
             }
 
@@ -215,7 +302,7 @@ impl RunState {
                 return invalid_building_quote(
                     cost,
                     footprint,
-                    "Building footprint is occupied".to_owned(),
+                    InvalidPlacement::BuildingFootprintIsOccupied,
                 );
             }
 
@@ -223,7 +310,7 @@ impl RunState {
                 return invalid_building_quote(
                     cost,
                     footprint,
-                    "Building footprint contains a Road".to_owned(),
+                    InvalidPlacement::BuildingFootprintContainsRoad,
                 );
             }
         }
@@ -240,27 +327,33 @@ impl RunState {
         &mut self,
         kind: BuildingKind,
         origin: TileCoord,
-    ) -> Result<BuildingId, String> {
+    ) -> Result<BuildingId, InvalidPlacement> {
         self.ensure_editable()?;
 
         let quote = self.quote_building(kind, origin);
         if !quote.valid {
             return Err(quote
                 .invalid_reason
-                .unwrap_or_else(|| "Building placement is invalid".to_owned()));
+                .expect("invalid quote should carry reason"));
         }
 
         let id = BuildingId(self.next_building_id);
         self.next_building_id += 1;
         self.sky_coin -= quote.cost;
         self.buildings.push(Building { id, kind, origin });
+        self.recalculate_city_outputs();
         Ok(id)
     }
 
-    pub fn quote_road_path(&self, path: &[TileCoord]) -> RoadPathQuote {
-        let tiles = normalize_road_path(path);
+    pub fn quote_roads(&self, coords: &[TileCoord]) -> RoadPlacementQuote {
+        let tiles = normalize_road_coords(coords);
         if tiles.is_empty() {
-            return invalid_road_path_quote(tiles, Vec::new(), 0, "Road path is empty".to_owned());
+            return invalid_road_quote(
+                tiles,
+                Vec::new(),
+                0,
+                InvalidPlacement::RoadPlacementIsEmpty,
+            );
         }
 
         let mut roads = self.roads.clone();
@@ -271,11 +364,11 @@ impl RunState {
         for coord in tiles.iter().copied() {
             if let Some(previous) = previous_coord {
                 if !are_orthogonal_neighbors(previous, coord) {
-                    return invalid_road_path_quote(
+                    return invalid_road_quote(
                         tiles,
                         new_roads,
                         total_cost,
-                        "Road path must be orthogonally continuous".to_owned(),
+                        InvalidPlacement::RoadPlacementMustBeOrthogonallyContinuous,
                     );
                 }
 
@@ -283,11 +376,11 @@ impl RunState {
                     && let Some(existing_road) = roads.get(&coord)
                     && !roads_can_connect(*previous_road, *existing_road)
                 {
-                    return invalid_road_path_quote(
+                    return invalid_road_quote(
                         tiles,
                         new_roads,
                         total_cost,
-                        "Road height difference is too steep".to_owned(),
+                        InvalidPlacement::RoadHeightDifferenceTooSteep,
                     );
                 }
             }
@@ -298,20 +391,20 @@ impl RunState {
             }
 
             if self.is_occupied(coord) {
-                return invalid_road_path_quote(
+                return invalid_road_quote(
                     tiles,
                     new_roads,
                     total_cost,
-                    "Road cannot overlap a Building".to_owned(),
+                    InvalidPlacement::RoadCannotOverlapBuilding,
                 );
             }
 
             let Some(road) = self.proposed_road(coord, previous_coord, &roads) else {
-                return invalid_road_path_quote(
+                return invalid_road_quote(
                     tiles,
                     new_roads,
                     total_cost,
-                    "Sky Road must connect to the connected Road network".to_owned(),
+                    InvalidPlacement::RoadHeightDifferenceTooSteep,
                 );
             };
 
@@ -319,21 +412,21 @@ impl RunState {
                 && let Some(previous_road) = roads.get(&previous)
                 && !roads_can_connect(*previous_road, road)
             {
-                return invalid_road_path_quote(
+                return invalid_road_quote(
                     tiles,
                     new_roads,
                     total_cost,
-                    "Road height difference is too steep".to_owned(),
+                    InvalidPlacement::RoadHeightDifferenceTooSteep,
                 );
             }
 
             total_cost += self.road_cost_for(coord);
             if self.sky_coin < total_cost {
-                return invalid_road_path_quote(
+                return invalid_road_quote(
                     tiles,
                     new_roads,
                     total_cost,
-                    "Not enough SkyCoin".to_owned(),
+                    InvalidPlacement::NotEnoughSkyCoin,
                 );
             }
 
@@ -342,7 +435,7 @@ impl RunState {
             previous_coord = Some(coord);
         }
 
-        RoadPathQuote {
+        RoadPlacementQuote {
             valid: true,
             total_cost,
             tiles,
@@ -351,14 +444,17 @@ impl RunState {
         }
     }
 
-    pub fn place_road_path(&mut self, path: &[TileCoord]) -> Result<Vec<TileCoord>, String> {
+    pub fn place_roads(
+        &mut self,
+        coords: &[TileCoord],
+    ) -> Result<Vec<TileCoord>, InvalidPlacement> {
         self.ensure_editable()?;
 
-        let quote = self.quote_road_path(path);
+        let quote = self.quote_roads(coords);
         if !quote.valid {
             return Err(quote
                 .invalid_reason
-                .unwrap_or_else(|| "Road placement is invalid".to_owned()));
+                .expect("invalid quote should carry reason"));
         }
 
         let placed_coords = quote
@@ -370,14 +466,19 @@ impl RunState {
         for road in quote.new_roads {
             self.roads.insert(road.coord, road);
         }
+        self.recalculate_city_outputs();
 
         Ok(placed_coords)
     }
 
-    pub fn demolish_tile(&mut self, coord: TileCoord) -> Result<DemolitionOutcome, String> {
+    pub fn demolish_tile(
+        &mut self,
+        coord: TileCoord,
+    ) -> Result<DemolitionOutcome, InvalidPlacement> {
         self.ensure_editable()?;
 
         if self.roads.remove(&coord).is_some() {
+            self.recalculate_city_outputs();
             return Ok(DemolitionOutcome::Road { coord });
         }
 
@@ -386,15 +487,16 @@ impl RunState {
             .iter()
             .position(|building| building_footprint(building.origin).contains(&coord))
         else {
-            return Err("Nothing to demolish".to_owned());
+            return Err(InvalidPlacement::NothingToDemolish);
         };
 
         let building = &self.buildings[building_index];
         if building.kind == BuildingKind::CityCore {
-            return Err("City Core cannot be demolished".to_owned());
+            return Err(InvalidPlacement::CityCoreCannotBeDemolished);
         }
 
         let building = self.buildings.remove(building_index);
+        self.recalculate_city_outputs();
         Ok(DemolitionOutcome::Building {
             id: building.id,
             kind: building.kind,
@@ -437,19 +539,15 @@ impl RunState {
 
         let inherited_height = previous_coord
             .and_then(|previous| roads.get(&previous).copied())
-            .filter(|previous| {
-                let connected_roads = connected_road_coords(roads, self.city_core_footprint());
-                connected_roads.contains(&previous.coord)
-            })
             .map(|previous| previous.height)
             .or_else(|| {
-                let connected_roads = connected_road_coords(roads, self.city_core_footprint());
                 orthogonal_neighbors(coord)
                     .into_iter()
                     .filter_map(|neighbor| roads.get(&neighbor))
-                    .find(|road| connected_roads.contains(&road.coord))
                     .map(|road| road.height)
-            })?;
+                    .next()
+            })
+            .unwrap_or(0);
 
         Some(Road {
             coord,
@@ -472,12 +570,62 @@ impl RunState {
             .map(|building| building_footprint(building.origin))
     }
 
-    fn ensure_editable(&self) -> Result<(), String> {
-        if self.status == RunStatus::Bankrupt {
-            return Err("Run is bankrupt".to_owned());
+    fn ensure_editable(&self) -> Result<(), InvalidPlacement> {
+        if self.status != RunStatus::Running {
+            return Err(InvalidPlacement::RunIsNotEditable);
         }
 
         Ok(())
+    }
+
+    fn recalculate_city_outputs(&mut self) {
+        let active_kinds = self
+            .active_non_core_buildings()
+            .map(|building| building.kind)
+            .collect::<Vec<_>>();
+
+        self.citizen_capacity = CITY_CORE_CITIZEN_CAPACITY;
+        self.food.production_per_second = 0.0;
+
+        for kind in active_kinds {
+            match kind {
+                BuildingKind::House => {
+                    self.citizen_capacity += HOUSE_CITIZEN_CAPACITY;
+                }
+                BuildingKind::Farm => {
+                    self.food.production_per_second += FARM_FOOD_PRODUCTION_PER_SECOND;
+                }
+                BuildingKind::CityCore
+                | BuildingKind::Workshop
+                | BuildingKind::Market
+                | BuildingKind::Monument => {}
+            }
+        }
+
+        self.food.consumption_per_second = self.citizens as f64 * FOOD_CONSUMPTION_PER_CITIZEN;
+        self.citizens = self.citizens.min(self.citizen_capacity);
+    }
+
+    fn active_non_core_buildings(&self) -> impl Iterator<Item = &Building> {
+        let connected_roads = self.connected_road_coords();
+        self.buildings
+            .iter()
+            .filter(|building| building.kind != BuildingKind::CityCore)
+            .filter(move |building| {
+                building_footprint(building.origin)
+                    .into_iter()
+                    .flat_map(orthogonal_neighbors)
+                    .any(|coord| connected_roads.contains(&coord))
+            })
+    }
+
+    fn apply_citizen_arrivals(&mut self) {
+        if self.food.current <= 0 || self.citizens >= self.citizen_capacity {
+            return;
+        }
+
+        let arriving = CITIZEN_ARRIVAL_PER_SECOND.floor() as u32;
+        self.citizens = (self.citizens + arriving).min(self.citizen_capacity);
     }
 
     fn apply_sky_coin_drain(&mut self) {
@@ -529,7 +677,7 @@ fn scaled_cost(base_cost: i64, placed_count: i32) -> i64 {
 fn invalid_building_quote(
     cost: i64,
     footprint: [TileCoord; 4],
-    invalid_reason: String,
+    invalid_reason: InvalidPlacement,
 ) -> BuildingQuote {
     BuildingQuote {
         valid: false,
@@ -539,13 +687,13 @@ fn invalid_building_quote(
     }
 }
 
-fn invalid_road_path_quote(
+fn invalid_road_quote(
     tiles: Vec<TileCoord>,
     new_roads: Vec<Road>,
     total_cost: i64,
-    invalid_reason: String,
-) -> RoadPathQuote {
-    RoadPathQuote {
+    invalid_reason: InvalidPlacement,
+) -> RoadPlacementQuote {
+    RoadPlacementQuote {
         valid: false,
         total_cost,
         tiles,
@@ -554,11 +702,11 @@ fn invalid_road_path_quote(
     }
 }
 
-fn normalize_road_path(path: &[TileCoord]) -> Vec<TileCoord> {
+fn normalize_road_coords(coords: &[TileCoord]) -> Vec<TileCoord> {
     let mut seen = BTreeSet::new();
     let mut normalized = Vec::new();
 
-    for coord in path {
+    for coord in coords {
         if seen.insert(*coord) {
             normalized.push(*coord);
         }
@@ -756,18 +904,18 @@ mod road_tests {
         assert!(!quote.valid);
         assert_eq!(
             quote.invalid_reason,
-            Some("Building footprint contains a Road".to_owned())
+            Some(InvalidPlacement::BuildingFootprintContainsRoad)
         );
     }
 
     #[test]
-    fn road_path_quote_charges_new_island_and_sky_roads_only() {
+    fn road_quote_charges_new_island_and_sky_roads_only() {
         let mut run = RunState::start(7);
         let existing_sky_road = TileCoord::new(20, 20);
         let new_sky_road = TileCoord::new(20, 21);
         insert_existing_connected_road_chain_to(&mut run, existing_sky_road);
 
-        let quote = run.quote_road_path(&[existing_sky_road, new_sky_road, new_sky_road]);
+        let quote = run.quote_roads(&[existing_sky_road, new_sky_road, new_sky_road]);
 
         assert!(quote.valid, "{quote:?}");
         assert_eq!(quote.tiles, vec![existing_sky_road, new_sky_road]);
@@ -782,7 +930,7 @@ mod road_tests {
     }
 
     #[test]
-    fn road_placement_rejects_invalid_whole_path() {
+    fn road_placement_rejects_invalid_whole_drag() {
         let mut run = RunState::start(7);
         let building_origin = valid_unoccupied_building_origin(&run);
         let building_id = run
@@ -790,22 +938,22 @@ mod road_tests {
             .unwrap();
         let before_sky_coin = run.sky_coin;
 
-        let result = run.place_road_path(&[building_origin]);
+        let result = run.place_roads(&[building_origin]);
 
         assert_eq!(building_id, BuildingId(1));
-        assert_eq!(result, Err("Road cannot overlap a Building".to_owned()));
+        assert_eq!(result, Err(InvalidPlacement::RoadCannotOverlapBuilding));
         assert_eq!(run.sky_coin, before_sky_coin);
         assert!(run.roads.is_empty());
     }
 
     #[test]
-    fn road_placement_rejects_unaffordable_whole_path() {
+    fn road_placement_rejects_unaffordable_whole_drag() {
         let mut run = RunState::start(7);
         run.sky_coin = 1;
 
-        let result = run.place_road_path(&[TileCoord::new(0, -1)]);
+        let result = run.place_roads(&[TileCoord::new(0, -1)]);
 
-        assert_eq!(result, Err("Not enough SkyCoin".to_owned()));
+        assert_eq!(result, Err(InvalidPlacement::NotEnoughSkyCoin));
         assert_eq!(run.sky_coin, 1);
         assert!(run.roads.is_empty());
     }
@@ -813,7 +961,7 @@ mod road_tests {
     #[test]
     fn road_connectivity_reaches_city_core_through_orthogonal_chains() {
         let mut run = RunState::start(7);
-        run.place_road_path(&[
+        run.place_roads(&[
             TileCoord::new(0, -1),
             TileCoord::new(0, -2),
             TileCoord::new(0, -3),
@@ -834,7 +982,12 @@ mod road_tests {
             .unwrap();
         assert!(!run.is_building_active(disconnected_id));
 
-        run.place_road_path(&[TileCoord::new(0, -1)]).unwrap();
+        run.place_roads(&[
+            TileCoord::new(0, -1),
+            TileCoord::new(0, -2),
+            TileCoord::new(0, -3),
+        ])
+        .unwrap();
         let connected_origin = valid_building_origin_adjacent_to_connected_road(&run);
         let connected_id = run
             .place_building(BuildingKind::Farm, connected_origin)
@@ -848,7 +1001,7 @@ mod road_tests {
     #[test]
     fn demolish_removes_roads_without_refund() {
         let mut run = RunState::start(7);
-        run.place_road_path(&[TileCoord::new(0, -1)]).unwrap();
+        run.place_roads(&[TileCoord::new(0, -1)]).unwrap();
         let sky_coin_after_placement = run.sky_coin;
 
         let outcome = run.demolish_tile(TileCoord::new(0, -1)).unwrap();
@@ -889,7 +1042,7 @@ mod road_tests {
 
         let result = run.demolish_tile(TileCoord::new(0, 0));
 
-        assert_eq!(result, Err("City Core cannot be demolished".to_owned()));
+        assert_eq!(result, Err(InvalidPlacement::CityCoreCannotBeDemolished));
         assert!(
             run.buildings
                 .iter()
@@ -900,7 +1053,7 @@ mod road_tests {
     #[test]
     fn demolition_can_disconnect_roads_and_buildings() {
         let mut run = RunState::start(7);
-        run.place_road_path(&[
+        run.place_roads(&[
             TileCoord::new(0, -1),
             TileCoord::new(0, -2),
             TileCoord::new(0, -3),
@@ -922,18 +1075,80 @@ mod road_tests {
     #[test]
     fn bankrupt_run_rejects_placement_and_demolition() {
         let mut run = RunState::start(7);
-        run.place_road_path(&[TileCoord::new(0, -1)]).unwrap();
+        run.place_roads(&[TileCoord::new(0, -1)]).unwrap();
         let origin = valid_unoccupied_building_origin(&run);
         run.status = RunStatus::Bankrupt;
 
         let building_result = run.place_building(BuildingKind::House, origin);
-        let road_result = run.place_road_path(&[TileCoord::new(0, -2)]);
+        let road_result = run.place_roads(&[TileCoord::new(0, -2)]);
         let demolish_result = run.demolish_tile(TileCoord::new(0, -1));
 
-        assert_eq!(building_result, Err("Run is bankrupt".to_owned()));
-        assert_eq!(road_result, Err("Run is bankrupt".to_owned()));
-        assert_eq!(demolish_result, Err("Run is bankrupt".to_owned()));
+        assert_eq!(building_result, Err(InvalidPlacement::RunIsNotEditable));
+        assert_eq!(road_result, Err(InvalidPlacement::RunIsNotEditable));
+        assert_eq!(demolish_result, Err(InvalidPlacement::RunIsNotEditable));
         assert!(run.roads.contains_key(&TileCoord::new(0, -1)));
+    }
+
+    #[test]
+    fn disconnected_sky_roads_can_be_placed() {
+        let mut run = RunState::start(7);
+
+        let placed = run
+            .place_roads(&[TileCoord::new(20, 20), TileCoord::new(20, 21)])
+            .unwrap();
+
+        assert_eq!(placed, vec![TileCoord::new(20, 20), TileCoord::new(20, 21)]);
+        assert_eq!(
+            run.road_kind_at(TileCoord::new(20, 20)),
+            Some(RoadKind::Sky)
+        );
+        assert!(!run.is_road_connected(TileCoord::new(20, 20)));
+    }
+
+    #[test]
+    fn only_active_buildings_affect_food_and_citizen_capacity() {
+        let mut run = RunState::start(7);
+        let disconnected_house = valid_unoccupied_building_origin(&run);
+        run.place_building(BuildingKind::House, disconnected_house)
+            .unwrap();
+
+        run.tick();
+
+        assert_eq!(run.citizen_capacity, 5);
+        assert_eq!(run.food.production_per_second, 0.0);
+
+        let mut run = RunState::start(7);
+        run.place_roads(&[
+            TileCoord::new(0, -1),
+            TileCoord::new(0, -2),
+            TileCoord::new(0, -3),
+        ])
+        .unwrap();
+        let connected_house = valid_building_origin_adjacent_to_connected_road(&run);
+        run.place_building(BuildingKind::House, connected_house)
+            .unwrap();
+
+        run.tick();
+
+        assert_eq!(run.citizen_capacity, 11);
+
+        let mut run = RunState::start(7);
+        run.place_roads(&[
+            TileCoord::new(0, -1),
+            TileCoord::new(0, -2),
+            TileCoord::new(0, -3),
+        ])
+        .unwrap();
+        let connected_farm = valid_building_origin_adjacent_to_connected_road(&run);
+        run.place_building(BuildingKind::Farm, connected_farm)
+            .unwrap();
+
+        run.tick();
+
+        assert_eq!(
+            run.food.production_per_second,
+            FARM_FOOD_PRODUCTION_PER_SECOND
+        );
     }
 
     fn valid_unoccupied_building_origin(run: &RunState) -> TileCoord {

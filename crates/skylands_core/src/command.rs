@@ -1,4 +1,6 @@
-use crate::simulation::{BuildingId, BuildingKind, DemolitionOutcome, GameState, RunState};
+use crate::simulation::{
+    BuildingId, BuildingKind, DemolitionOutcome, GameState, InvalidPlacement, RunState, RunStatus,
+};
 use crate::world::TileCoord;
 use std::error::Error;
 use std::fmt::{Display, Formatter};
@@ -13,12 +15,13 @@ pub enum Command {
         kind: BuildingKind,
         origin: TileCoord,
     },
-    PlaceRoadPath {
-        path: Vec<TileCoord>,
+    PlaceRoads {
+        coords: Vec<TileCoord>,
     },
     DemolishTile {
         coord: TileCoord,
     },
+    TogglePause,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -26,16 +29,18 @@ pub enum CommandOutcome {
     RunStarted,
     Ticked,
     BuildingPlaced { id: BuildingId },
-    RoadPathPlaced { coords: Vec<TileCoord> },
+    RoadsPlaced { coords: Vec<TileCoord> },
     RoadDemolished { coord: TileCoord },
     BuildingDemolished { id: BuildingId, kind: BuildingKind },
+    RunPaused,
+    RunResumed,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum CommandError {
     RunAlreadyStarted,
     NoRunStarted,
-    PlacementRejected(String),
+    InvalidPlacement(InvalidPlacement),
 }
 
 impl Display for CommandError {
@@ -43,7 +48,9 @@ impl Display for CommandError {
         match self {
             Self::RunAlreadyStarted => write!(formatter, "a Run is already started"),
             Self::NoRunStarted => write!(formatter, "no Run is started"),
-            Self::PlacementRejected(reason) => write!(formatter, "placement rejected: {reason}"),
+            Self::InvalidPlacement(reason) => {
+                write!(formatter, "invalid placement: {}", reason.message())
+            }
         }
     }
 }
@@ -76,16 +83,16 @@ impl GameState {
                     .ok_or(CommandError::NoRunStarted)?;
                 run.place_building(kind, origin)
                     .map(|id| CommandOutcome::BuildingPlaced { id })
-                    .map_err(CommandError::PlacementRejected)
+                    .map_err(CommandError::InvalidPlacement)
             }
-            Command::PlaceRoadPath { path } => {
+            Command::PlaceRoads { coords } => {
                 let run = self
                     .current_run
                     .as_mut()
                     .ok_or(CommandError::NoRunStarted)?;
-                run.place_road_path(&path)
-                    .map(|coords| CommandOutcome::RoadPathPlaced { coords })
-                    .map_err(CommandError::PlacementRejected)
+                run.place_roads(&coords)
+                    .map(|coords| CommandOutcome::RoadsPlaced { coords })
+                    .map_err(CommandError::InvalidPlacement)
             }
             Command::DemolishTile { coord } => {
                 let run = self
@@ -94,7 +101,18 @@ impl GameState {
                     .ok_or(CommandError::NoRunStarted)?;
                 run.demolish_tile(coord)
                     .map(command_outcome_from_demolition)
-                    .map_err(CommandError::PlacementRejected)
+                    .map_err(CommandError::InvalidPlacement)
+            }
+            Command::TogglePause => {
+                let run = self
+                    .current_run
+                    .as_mut()
+                    .ok_or(CommandError::NoRunStarted)?;
+                run.toggle_pause();
+                Ok(match run.status {
+                    RunStatus::Paused => CommandOutcome::RunPaused,
+                    _ => CommandOutcome::RunResumed,
+                })
             }
         }
     }
@@ -146,7 +164,12 @@ mod tests {
             origin: TileCoord::new(0, 0),
         });
 
-        assert!(matches!(result, Err(CommandError::PlacementRejected(_))));
+        assert_eq!(
+            result,
+            Err(CommandError::InvalidPlacement(
+                InvalidPlacement::BuildingFootprintIsOccupied,
+            ))
+        );
     }
 
     #[test]
@@ -193,22 +216,51 @@ mod tests {
     }
 
     #[test]
-    fn place_road_path_returns_a_command_outcome() {
+    fn place_roads_returns_a_command_outcome() {
         let mut game = GameState::empty();
         game.apply(Command::StartRun { seed: 7 }).unwrap();
 
         let outcome = game
-            .apply(Command::PlaceRoadPath {
-                path: vec![TileCoord::new(0, -1)],
+            .apply(Command::PlaceRoads {
+                coords: vec![TileCoord::new(0, -1)],
             })
             .unwrap();
 
         assert_eq!(
             outcome,
-            CommandOutcome::RoadPathPlaced {
+            CommandOutcome::RoadsPlaced {
                 coords: vec![TileCoord::new(0, -1)]
             }
         );
+    }
+
+    #[test]
+    fn toggle_pause_stops_and_resumes_tick_effects() {
+        let mut game = GameState::empty();
+        game.apply(Command::StartRun { seed: 7 }).unwrap();
+
+        assert_eq!(
+            game.apply(Command::TogglePause),
+            Ok(CommandOutcome::RunPaused)
+        );
+        assert_eq!(game.apply(Command::Tick), Ok(CommandOutcome::Ticked));
+        let paused_run = game.current_run.as_ref().unwrap();
+        assert_eq!(paused_run.elapsed_seconds, 0);
+        assert_eq!(
+            game.apply(Command::PlaceRoads {
+                coords: vec![TileCoord::new(0, -1)],
+            }),
+            Err(CommandError::InvalidPlacement(
+                InvalidPlacement::RunIsNotEditable,
+            ))
+        );
+
+        assert_eq!(
+            game.apply(Command::TogglePause),
+            Ok(CommandOutcome::RunResumed)
+        );
+        assert_eq!(game.apply(Command::Tick), Ok(CommandOutcome::Ticked));
+        assert_eq!(game.current_run.as_ref().unwrap().elapsed_seconds, 1);
     }
 
     fn valid_unoccupied_building_origin(run: &RunState) -> TileCoord {
