@@ -78,12 +78,15 @@ impl GameState {
                     .map(|id| CommandOutcome::BuildingPlaced { id })
                     .map_err(CommandError::PlacementRejected)
             }
-            Command::PlaceRoadPath { path: _ } => Err(CommandError::PlacementRejected({
-                self.current_run
-                    .as_ref()
+            Command::PlaceRoadPath { path } => {
+                let run = self
+                    .current_run
+                    .as_mut()
                     .ok_or(CommandError::NoRunStarted)?;
-                "Road placement is not implemented yet".to_owned()
-            })),
+                run.place_road_path(&path)
+                    .map(|coords| CommandOutcome::RoadPathPlaced { coords })
+                    .map_err(CommandError::PlacementRejected)
+            }
             Command::DemolishTile { coord: _ } => Err(CommandError::PlacementRejected({
                 self.current_run
                     .as_ref()
@@ -156,27 +159,38 @@ mod tests {
     }
 
     #[test]
-    fn road_and_demolition_commands_exist_but_are_not_implemented_yet() {
+    fn demolition_command_exists_but_is_not_implemented_yet() {
         let mut game = GameState::empty();
         game.apply(Command::StartRun { seed: 7 }).unwrap();
 
-        let road_result = game.apply(Command::PlaceRoadPath {
-            path: vec![TileCoord::new(2, 0)],
-        });
         let demolish_result = game.apply(Command::DemolishTile {
             coord: TileCoord::new(2, 0),
         });
 
         assert!(matches!(
-            road_result,
-            Err(CommandError::PlacementRejected(reason))
-            if reason == "Road placement is not implemented yet"
-        ));
-        assert!(matches!(
             demolish_result,
             Err(CommandError::PlacementRejected(reason))
             if reason == "Demolition is not implemented yet"
         ));
+    }
+
+    #[test]
+    fn place_road_path_returns_a_command_outcome() {
+        let mut game = GameState::empty();
+        game.apply(Command::StartRun { seed: 7 }).unwrap();
+
+        let outcome = game
+            .apply(Command::PlaceRoadPath {
+                path: vec![TileCoord::new(0, -1)],
+            })
+            .unwrap();
+
+        assert_eq!(
+            outcome,
+            CommandOutcome::RoadPathPlaced {
+                coords: vec![TileCoord::new(0, -1)]
+            }
+        );
     }
 
     fn valid_unoccupied_building_origin(run: &RunState) -> TileCoord {
