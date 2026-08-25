@@ -129,6 +129,8 @@ pub struct RunState {
     pub citizen_capacity: u32,
     pub food: FoodStock,
     pub islands: Vec<FlyingIsland>,
+    #[serde(skip)]
+    tile_heights: BTreeMap<TileCoord, i32>,
     pub buildings: Vec<Building>,
     #[serde(with = "road_map_serde")]
     pub roads: BTreeMap<TileCoord, Road>,
@@ -150,6 +152,9 @@ impl GameState {
 
 impl RunState {
     pub fn start(seed: u64) -> Self {
+        let islands = FlyingIsland::generated_many(seed);
+        let tile_heights = tile_height_index(&islands);
+
         Self {
             seed,
             status: RunStatus::Running,
@@ -164,7 +169,8 @@ impl RunState {
                 production_per_second: 0.0,
                 consumption_per_second: 0.0,
             },
-            islands: vec![FlyingIsland::generated(seed)],
+            islands,
+            tile_heights,
             buildings: vec![Building {
                 id: BuildingId(0),
                 kind: BuildingKind::CityCore,
@@ -191,6 +197,8 @@ impl RunState {
         roads: BTreeMap<TileCoord, Road>,
         next_building_id: u32,
     ) -> Self {
+        let tile_heights = tile_height_index(&islands);
+
         Self {
             seed,
             status,
@@ -201,6 +209,7 @@ impl RunState {
             citizen_capacity,
             food,
             islands,
+            tile_heights,
             buildings,
             roads,
             next_building_id,
@@ -244,9 +253,7 @@ impl RunState {
     }
 
     pub fn tile_height(&self, coord: TileCoord) -> Option<i32> {
-        self.islands
-            .iter()
-            .find_map(|island| island.tile(coord).map(|tile| tile.height))
+        self.tile_heights.get(&coord).copied()
     }
 
     pub fn is_occupied(&self, coord: TileCoord) -> bool {
@@ -774,6 +781,14 @@ fn orthogonal_neighbors(coord: TileCoord) -> [TileCoord; 4] {
     ]
 }
 
+fn tile_height_index(islands: &[FlyingIsland]) -> BTreeMap<TileCoord, i32> {
+    islands
+        .iter()
+        .flat_map(|island| island.tiles())
+        .map(|tile| (tile.coord, tile.height))
+        .collect()
+}
+
 mod road_map_serde {
     use super::Road;
     use crate::world::TileCoord;
@@ -799,6 +814,7 @@ mod road_map_serde {
 #[cfg(test)]
 mod road_tests {
     use super::*;
+    use std::time::{Duration, Instant};
 
     #[test]
     fn run_state_stores_roads_in_deterministic_tile_order() {
@@ -1148,6 +1164,23 @@ mod road_tests {
         assert_eq!(
             run.food.production_per_second,
             FARM_FOOD_PRODUCTION_PER_SECOND
+        );
+    }
+
+    #[test]
+    fn empty_tile_height_lookup_stays_fast_with_generated_islands() {
+        let run = RunState::start(7);
+        let empty_coord = TileCoord::new(10_000, 10_000);
+
+        let started_at = Instant::now();
+        for _ in 0..20_000 {
+            assert_eq!(run.tile_height(empty_coord), None);
+        }
+        let elapsed = started_at.elapsed();
+
+        assert!(
+            elapsed < Duration::from_millis(50),
+            "20,000 empty tile height lookups took {elapsed:?}"
         );
     }
 

@@ -40,6 +40,7 @@ pub struct RunSaveV1 {
     pub citizens: u32,
     pub citizen_capacity: u32,
     pub food: FoodStock,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub islands: Vec<FlyingIsland>,
     pub buildings: Vec<Building>,
     pub roads: Vec<Road>,
@@ -77,7 +78,7 @@ impl From<&RunState> for RunSaveV1 {
             citizens: run.citizens,
             citizen_capacity: run.citizen_capacity,
             food: run.food.clone(),
-            islands: run.islands.clone(),
+            islands: Vec::new(),
             buildings: run.buildings.clone(),
             roads: run.roads.values().copied().collect(),
             next_building_id: run.next_building_id,
@@ -92,6 +93,7 @@ impl From<RunSaveV1> for RunState {
             .into_iter()
             .map(|road| (road.coord, road))
             .collect();
+        let islands = FlyingIsland::generated_many(save.seed);
 
         RunState::restored(
             save.seed,
@@ -102,7 +104,7 @@ impl From<RunSaveV1> for RunState {
             save.citizens,
             save.citizen_capacity,
             save.food,
-            save.islands,
+            islands,
             save.buildings,
             roads,
             save.next_building_id,
@@ -198,5 +200,17 @@ mod tests {
 
         assert_eq!(restored_run.elapsed_seconds, 42);
         assert!(restored_run.roads.contains_key(&TileCoord::new(0, -1)));
+    }
+
+    #[test]
+    fn run_save_does_not_serialize_generated_islands() {
+        let save = SaveStateV1 {
+            current_run: Some(RunSaveV1::from(&RunState::start(10))),
+            ..SaveStateV1::empty()
+        };
+
+        let json = save.to_json().unwrap();
+
+        assert!(!json.contains("\"tiles\""));
     }
 }

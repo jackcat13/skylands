@@ -1,8 +1,8 @@
 use macroquad::camera::Camera;
 use macroquad::prelude::*;
 use skylands_core::{
-    BuildingKind, Command, CommandError, CommandOutcome, GameState, InvalidPlacement, Road,
-    RoadKind, RunSave, RunState, RunStatus, SaveStateV1, TileCoord,
+    BuildingKind, Command, CommandError, CommandOutcome, FlyingIsland, GameState, InvalidPlacement,
+    Road, RoadKind, RunSave, RunState, RunStatus, SaveStateV1, TileCoord,
 };
 
 const SAVE_FILE: &str = "skylands-save.json";
@@ -10,7 +10,8 @@ const TILE_SIZE: f32 = 1.0;
 const TILE_HEIGHT: f32 = 0.25;
 const ROAD_HEIGHT: f32 = 0.06;
 const MAX_CATCH_UP_TICKS: u32 = 3;
-const EMPTY_TILE_PICK_COORD_LIMIT: i32 = 32;
+const EMPTY_TILE_PICK_RADIUS_PADDING: i32 = 10;
+const MAX_MEDIUM_TERRAIN_CAMERA_DISTANCE: f32 = 22.0;
 const TOOLBAR_HEIGHT: f32 = 76.0;
 const TOP_BAR_HEIGHT: f32 = 40.0;
 const COMMAND_BANNER_SECONDS: f32 = 1.5;
@@ -79,7 +80,7 @@ async fn main() {
         let preview = Preview::from_state(run, &ui, hovered_world_tile);
 
         set_camera(&camera.to_macroquad());
-        draw_run(run, hovered_world_tile, &preview);
+        draw_run(run, &camera, hovered_world_tile, &preview);
         set_default_camera();
 
         draw_hud(run, hovered_world_tile, &ui, &preview);
@@ -380,6 +381,14 @@ impl CityCamera {
             ..Default::default()
         }
     }
+
+    fn target_tile(&self) -> TileCoord {
+        TileCoord::new(self.target.x.round() as i32, self.target.z.round() as i32)
+    }
+
+    fn visible_tile_radius(&self) -> i32 {
+        (self.distance * 1.6).ceil() as i32 + EMPTY_TILE_PICK_RADIUS_PADDING
+    }
 }
 
 fn handle_global_hotkeys(game: &mut GameState, ui: &mut AppUi) {
@@ -512,11 +521,25 @@ fn push_road_drag_step(tiles: &mut Vec<TileCoord>, coord: TileCoord) {
     }
 }
 
-fn draw_run(run: &RunState, hovered_tile: Option<TileCoord>, preview: &Preview) {
+fn draw_run(
+    run: &RunState,
+    camera: &CityCamera,
+    hovered_tile: Option<TileCoord>,
+    preview: &Preview,
+) {
     for island in &run.islands {
+        if !island_is_near_camera(island, camera) {
+            continue;
+        }
+
         for tile in island.tiles() {
             let is_hovered = hovered_tile == Some(tile.coord);
-            draw_tile(tile.coord, tile.height, is_hovered);
+            draw_tile(
+                tile.coord,
+                tile.height,
+                is_hovered,
+                terrain_wires_visible(camera),
+            );
         }
     }
 
@@ -604,7 +627,7 @@ fn preview_road_kind(run: &RunState, coord: TileCoord) -> RoadKind {
     })
 }
 
-fn draw_tile(coord: TileCoord, height: i32, is_hovered: bool) {
+fn draw_tile(coord: TileCoord, height: i32, is_hovered: bool, draw_wires: bool) {
     let center = tile_center(coord, height);
     let color = if is_hovered {
         Color::from_rgba(247, 229, 104, 255)
@@ -618,11 +641,13 @@ fn draw_tile(coord: TileCoord, height: i32, is_hovered: bool) {
         None,
         color,
     );
-    draw_cube_wires(
-        center - vec3(0.0, TILE_HEIGHT * 0.5, 0.0),
-        vec3(TILE_SIZE, TILE_HEIGHT, TILE_SIZE),
-        Color::from_rgba(57, 92, 65, 255),
-    );
+    if draw_wires {
+        draw_cube_wires(
+            center - vec3(0.0, TILE_HEIGHT * 0.5, 0.0),
+            vec3(TILE_SIZE, TILE_HEIGHT, TILE_SIZE),
+            Color::from_rgba(57, 92, 65, 255),
+        );
+    }
 }
 
 fn draw_road(coord: TileCoord, height: i32, kind: RoadKind) {
@@ -677,6 +702,7 @@ fn pick_tile(run: &RunState, camera: &CityCamera) -> Option<TileCoord> {
     let island_hit = run
         .islands
         .iter()
+        .filter(|island| island_is_near_camera(island, camera))
         .flat_map(|island| island.tiles())
         .filter_map(|tile| {
             let center = tile_center(tile.coord, tile.height);
@@ -688,10 +714,10 @@ fn pick_tile(run: &RunState, camera: &CityCamera) -> Option<TileCoord> {
         .min_by(|left, right| left.0.total_cmp(&right.0))
         .map(|(_, coord)| coord);
 
-    island_hit.or_else(|| pick_empty_tile(ray))
+    island_hit.or_else(|| pick_empty_tile(ray, camera))
 }
 
-fn pick_empty_tile(ray: Ray) -> Option<TileCoord> {
+fn pick_empty_tile(ray: Ray, camera: &CityCamera) -> Option<TileCoord> {
     if ray.direction.y.abs() < f32::EPSILON {
         return None;
     }
@@ -703,12 +729,61 @@ fn pick_empty_tile(ray: Ray) -> Option<TileCoord> {
 
     let hit = ray.origin + ray.direction * distance;
     let coord = TileCoord::new(hit.x.round() as i32, hit.z.round() as i32);
-    if coord.x.abs() <= EMPTY_TILE_PICK_COORD_LIMIT && coord.z.abs() <= EMPTY_TILE_PICK_COORD_LIMIT
-    {
+    if manhattan_distance(coord, camera.target_tile()) <= camera.visible_tile_radius() {
         Some(coord)
     } else {
         None
     }
+}
+
+fn island_is_near_camera(island: &FlyingIsland, camera: &CityCamera) -> bool {
+    let Some((min, max)) = island.bounds() else {
+        return false;
+    };
+
+    let target = camera.target_tile();
+    let radius = camera.visible_tile_radius();
+
+    min.x <= target.x + radius
+        && max.x >= target.x - radius
+        && min.z <= target.z + radius
+        && max.z >= target.z - radius
+}
+
+fn terrain_wires_visible(camera: &CityCamera) -> bool {
+    camera.distance <= MAX_MEDIUM_TERRAIN_CAMERA_DISTANCE
+}
+
+fn terrain_tile_draw_count(
+    run: &RunState,
+    camera: &CityCamera,
+    _hovered_tile: Option<TileCoord>,
+) -> usize {
+    visible_terrain_tile_count(run, camera)
+}
+
+fn terrain_wire_draw_count(run: &RunState, camera: &CityCamera) -> usize {
+    if !terrain_wires_visible(camera) {
+        return 0;
+    }
+
+    run.islands
+        .iter()
+        .filter(|island| island_is_near_camera(island, camera))
+        .flat_map(|island| island.tiles())
+        .count()
+}
+
+fn visible_terrain_tile_count(run: &RunState, camera: &CityCamera) -> usize {
+    run.islands
+        .iter()
+        .filter(|island| island_is_near_camera(island, camera))
+        .map(|island| island.tiles().count())
+        .sum()
+}
+
+fn manhattan_distance(left: TileCoord, right: TileCoord) -> i32 {
+    (left.x - right.x).abs() + (left.z - right.z).abs()
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -1141,5 +1216,49 @@ mod tests {
                 "Inspect: tile (0, 0)".to_owned(),
             ]
         );
+    }
+
+    #[test]
+    fn default_camera_culls_most_generated_island_tiles() {
+        let run = RunState::start(7);
+        let camera = CityCamera::default();
+        let draw_count = terrain_tile_draw_count(&run, &camera, None);
+
+        assert!(
+            draw_count < 2_000,
+            "terrain tile draw count was {draw_count}"
+        );
+    }
+
+    #[test]
+    fn zoomed_out_camera_skips_terrain_wires_without_skipping_tiles() {
+        let run = RunState::start(7);
+        let camera = CityCamera {
+            distance: 28.0,
+            ..CityCamera::default()
+        };
+        let visible_tile_count = visible_terrain_tile_count(&run, &camera);
+        let draw_count = terrain_tile_draw_count(&run, &camera, None);
+        let wire_count = terrain_wire_draw_count(&run, &camera);
+
+        assert!(
+            visible_tile_count > 2_000,
+            "test should cover zoomed-out terrain growth; visible tile count was {visible_tile_count}"
+        );
+        assert_eq!(draw_count, visible_tile_count);
+        assert_eq!(wire_count, 0);
+    }
+
+    #[test]
+    fn zoomed_out_camera_still_draws_every_visible_terrain_tile() {
+        let run = RunState::start(7);
+        let camera = CityCamera {
+            distance: 28.0,
+            ..CityCamera::default()
+        };
+        let visible_tile_count = visible_terrain_tile_count(&run, &camera);
+        let draw_count = terrain_tile_draw_count(&run, &camera, None);
+
+        assert_eq!(draw_count, visible_tile_count);
     }
 }
