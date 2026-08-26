@@ -96,6 +96,10 @@ _Avoid_: Logistics, transit
 A one-tile placeable connection that links buildings into the city, cannot overlap buildings, and must be demolished before a building can be placed on its tile. Roads can be placed by dragging a path and paying per valid tile; the UI shows path validity and total SkyCoin cost before placement, and the whole path is rejected if total cost is unaffordable. A building is connected if any tile of its footprint is orthogonally adjacent to a road connected to the City Core. Disconnected buildings produce no outputs, and roads can be demolished with no refund.
 _Avoid_: Path, street
 
+**Road Network**:
+The set of Roads in a Run, evaluated for connectivity to the City Core.
+_Avoid_: Route graph, path network
+
 **Island Road**:
 A road built on a flying island tile with the normal SkyCoin cost. Island Roads can connect adjacent island tiles only when their height difference is one level or less.
 _Avoid_: Ground road
