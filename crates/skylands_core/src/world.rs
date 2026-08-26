@@ -15,6 +15,19 @@ impl TileCoord {
     pub const fn new(x: i32, z: i32) -> Self {
         Self { x, z }
     }
+
+    pub fn orthogonal_neighbors(self) -> [Self; 4] {
+        [
+            Self::new(self.x + 1, self.z),
+            Self::new(self.x - 1, self.z),
+            Self::new(self.x, self.z + 1),
+            Self::new(self.x, self.z - 1),
+        ]
+    }
+
+    pub fn manhattan_distance_to(self, other: Self) -> i32 {
+        (self.x - other.x).abs() + (self.z - other.z).abs()
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -152,9 +165,9 @@ fn plateau_height(
     raised_plateau: Plateau,
     lowered_plateau: Plateau,
 ) -> i32 {
-    if manhattan_distance(coord, raised_plateau.center) <= raised_plateau.radius {
+    if coord.manhattan_distance_to(raised_plateau.center) <= raised_plateau.radius {
         base_height + 1
-    } else if manhattan_distance(coord, lowered_plateau.center) <= lowered_plateau.radius {
+    } else if coord.manhattan_distance_to(lowered_plateau.center) <= lowered_plateau.radius {
         (base_height - 1).max(0)
     } else {
         base_height
@@ -182,10 +195,9 @@ fn generated_island_centers(seed: u64) -> Vec<TileCoord> {
                 (angle.sin() * radius).round() as i32,
             );
 
-            if centers
-                .iter()
-                .all(|existing| manhattan_distance(*existing, center) >= MIN_ISLAND_CENTER_DISTANCE)
-            {
+            if centers.iter().all(|existing| {
+                existing.manhattan_distance_to(center) >= MIN_ISLAND_CENTER_DISTANCE
+            }) {
                 break;
             }
 
@@ -228,10 +240,6 @@ fn tile_bounds(tiles: &[IslandTile]) -> Option<(TileCoord, TileCoord)> {
     }
 
     Some((min, max))
-}
-
-fn manhattan_distance(left: TileCoord, right: TileCoord) -> i32 {
-    (left.x - right.x).abs() + (left.z - right.z).abs()
 }
 
 fn upsert_tile(tiles: &mut Vec<IslandTile>, new_tile: IslandTile) {
@@ -340,12 +348,28 @@ mod tests {
             .filter_map(|island| island.bounds())
             .map(|(min, max)| {
                 let center = TileCoord::new((min.x + max.x) / 2, (min.z + max.z) / 2);
-                manhattan_distance(TileCoord::new(0, 0), center) / 20
+                TileCoord::new(0, 0).manhattan_distance_to(center) / 20
             })
             .collect();
         distance_buckets.sort_unstable();
         distance_buckets.dedup();
 
         assert!(distance_buckets.len() >= 10);
+    }
+
+    #[test]
+    fn tile_coord_reports_grid_geometry() {
+        let coord = TileCoord::new(2, -3);
+
+        assert_eq!(
+            coord.orthogonal_neighbors(),
+            [
+                TileCoord::new(3, -3),
+                TileCoord::new(1, -3),
+                TileCoord::new(2, -2),
+                TileCoord::new(2, -4),
+            ]
+        );
+        assert_eq!(coord.manhattan_distance_to(TileCoord::new(-1, 2)), 8);
     }
 }

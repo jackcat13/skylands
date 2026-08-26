@@ -69,45 +69,30 @@ impl GameState {
                 Ok(CommandOutcome::RunStarted)
             }
             Command::Tick => {
-                let run = self
-                    .current_run
-                    .as_mut()
-                    .ok_or(CommandError::NoRunStarted)?;
+                let run = self.current_run_mut()?;
                 run.tick();
                 Ok(CommandOutcome::Ticked)
             }
             Command::PlaceBuilding { kind, origin } => {
-                let run = self
-                    .current_run
-                    .as_mut()
-                    .ok_or(CommandError::NoRunStarted)?;
+                let run = self.current_run_mut()?;
                 run.place_building(kind, origin)
                     .map(|id| CommandOutcome::BuildingPlaced { id })
                     .map_err(CommandError::InvalidPlacement)
             }
             Command::PlaceRoads { coords } => {
-                let run = self
-                    .current_run
-                    .as_mut()
-                    .ok_or(CommandError::NoRunStarted)?;
+                let run = self.current_run_mut()?;
                 run.place_roads(&coords)
                     .map(|coords| CommandOutcome::RoadsPlaced { coords })
                     .map_err(CommandError::InvalidPlacement)
             }
             Command::DemolishTile { coord } => {
-                let run = self
-                    .current_run
-                    .as_mut()
-                    .ok_or(CommandError::NoRunStarted)?;
+                let run = self.current_run_mut()?;
                 run.demolish_tile(coord)
                     .map(command_outcome_from_demolition)
                     .map_err(CommandError::InvalidPlacement)
             }
             Command::TogglePause => {
-                let run = self
-                    .current_run
-                    .as_mut()
-                    .ok_or(CommandError::NoRunStarted)?;
+                let run = self.current_run_mut()?;
                 run.toggle_pause();
                 Ok(match run.status {
                     RunStatus::Paused => CommandOutcome::RunPaused,
@@ -115,6 +100,10 @@ impl GameState {
                 })
             }
         }
+    }
+
+    fn current_run_mut(&mut self) -> Result<&mut RunState, CommandError> {
+        self.current_run.as_mut().ok_or(CommandError::NoRunStarted)
     }
 }
 
